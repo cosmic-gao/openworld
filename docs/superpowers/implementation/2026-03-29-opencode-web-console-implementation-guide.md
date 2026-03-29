@@ -1,6 +1,6 @@
 # OpenCode Web 控制台实施指南 (极简版)
 
-> 版本: 2.0.0  
+> 版本: 2.1.0  
 > 日期: 2026-03-29  
 > 原则: 开源 + 极简
 
@@ -16,62 +16,74 @@ npx nuxi@latest init opencode-web
 cd opencode-web
 
 # 安装核心依赖
-pnpm add @opencode-ai/sdk prisma @prisma/client
-pnpm add -D prisma
+pnpm add @opencode-ai/sdk drizzle-orm better-sqlite3
+pnpm add -D drizzle-kit @types/better-sqlite3
 ```
 
-### 1.2 配置 Prisma
+### 1.2 配置 Drizzle
 
 ```bash
-# 初始化 Prisma (选择 SQLite)
-pnpm prisma init --datasource-provider sqlite
+# 创建 drizzle 配置
+touch drizzle.config.ts
 ```
 
-```prisma
-// prisma/schema.prisma
-datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
-}
+```typescript
+// drizzle.config.ts
+import { defineConfig } from 'drizzle-kit'
 
-generator client {
-  provider = "prisma-client-js"
-}
+export default defineConfig({
+  schema: './drizzle/schema.ts',
+  out: './drizzle/migrations',
+  dialect: 'sqlite',
+  dbCredentials: {
+    url: './data.db',
+  },
+})
+```
 
-model User {
-  id        String    @id @default(cuid())
-  email     String    @unique
-  password  String
-  name      String?
-  projects  Project[]
-  createdAt DateTime  @default(now())
-}
+```typescript
+// drizzle/schema.ts
+import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core'
 
-model Project {
-  id        String    @id @default(cuid())
-  name      String
-  userId    String
-  user      User      @relation(fields: [userId], references: [id])
-  createdAt DateTime  @default(now())
-}
+export const users = sqliteTable('users', {
+  id: text('id').primaryKey(),
+  email: text('email').notNull().unique(),
+  password: text('password').notNull(),
+  name: text('name'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+})
+
+export const projects = sqliteTable('projects', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  userId: text('user_id').notNull(),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+})
 ```
 
 ```bash
-# 创建数据库
-pnpm prisma db push
+# 创建数据库和迁移
+pnpm drizzle-kit generate
+pnpm drizzle-kit push
 ```
 
 ---
 
-## 2. Prisma 客户端
+## 2. Drizzle 客户端
 
 ```typescript
-// server/utils/prisma.ts
-import { PrismaClient } from '@prisma/client'
+// drizzle/index.ts
+import { drizzle } from 'drizzle-orm/better-sqlite3'
+import * as schema from './schema'
 
-const prisma = new PrismaClient()
+const sqlite = new Database('./data.db')
+export const db = drizzle({ schema })
+```
 
-export { prisma }
+```typescript
+// server/utils/db.ts
+import { db } from '~/drizzle'
+export { db }
 ```
 
 ---
@@ -808,13 +820,14 @@ const { messages, streaming } = useMessages()
 
 ```typescript
 // server/api/auth/login.post.ts
-import { prisma } from '~/server/utils/prisma'
+import { db } from '~/server/utils/db'
+import { users } from '~/drizzle/schema'
 
 export default defineEventHandler(async (event) => {
   const body = await readBody(event)
   const { email, password } = body
 
-  const user = await prisma.user.findUnique({ where: { email } })
+  const user = db.select().from(users).where(eq(users.email, email)).get()
   if (!user || user.password !== password) {
     throw createError({ statusCode: 401, message: 'Invalid credentials' })
   }
@@ -827,20 +840,27 @@ export default defineEventHandler(async (event) => {
 
 ```typescript
 // server/api/auth/register.post.ts
-import { prisma } from '~/server/utils/prisma'
+import { db } from '~/server/utils/db'
+import { users } from '~/drizzle/schema'
+import { eq } from 'drizzle-orm'
 
 export default defineEventHandler(async (event) => {
   const body = await readBody(event)
   const { email, password, name } = body
 
-  const existing = await prisma.user.findUnique({ where: { email } })
+  const existing = db.select().from(users).where(eq(users.email, email)).get()
   if (existing) {
     throw createError({ statusCode: 400, message: 'Email already exists' })
   }
 
-  const user = await prisma.user.create({
-    data: { email, password, name },
-  })
+  const user = {
+    id: crypto.randomUUID(),
+    email,
+    password,
+    name,
+    createdAt: new Date(),
+  }
+  db.insert(users).values(user).run()
 
   return {
     user: { id: user.id, email: user.email, name: user.name },
@@ -852,32 +872,36 @@ export default defineEventHandler(async (event) => {
 
 ```typescript
 // server/api/projects/index.get.ts
-import { prisma } from '~/server/utils/prisma'
+import { db } from '~/server/utils/db'
+import { projects } from '~/drizzle/schema'
+import { eq, desc } from 'drizzle-orm'
 
 export default defineEventHandler(async (event) => {
   const user = await getUser(event)
-  const projects = await prisma.project.findMany({
-    where: { userId: user.id },
-    orderBy: { createdAt: 'desc' },
-  })
-  return projects
+  const userProjects = db.select().from(projects)
+    .where(eq(projects.userId, user.id))
+    .orderBy(desc(projects.createdAt))
+    .all()
+  return userProjects
 })
 ```
 
 ```typescript
 // server/api/projects/index.post.ts
-import { prisma } from '~/server/utils/prisma'
+import { db } from '~/server/utils/db'
+import { projects } from '~/drizzle/schema'
 
 export default defineEventHandler(async (event) => {
   const user = await getUser(event)
   const body = await readBody(event)
 
-  const project = await prisma.project.create({
-    data: {
-      name: body.name,
-      userId: user.id,
-    },
-  })
+  const project = {
+    id: crypto.randomUUID(),
+    name: body.name,
+    userId: user.id,
+    createdAt: new Date(),
+  }
+  db.insert(projects).values(project).run()
 
   // 创建用户目录
   const dir = `/users/${user.id}/projects/${project.id}/workspace`
@@ -1246,7 +1270,7 @@ textarea {
 ## 8. 验证清单
 
 - [ ] 项目启动: `pnpm dev`
-- [ ] 数据库创建: `pnpm prisma db push`
+- [ ] 数据库创建: `pnpm drizzle-kit push`
 - [ ] 用户注册/登录
 - [ ] 创建项目
 - [ ] 发送消息，收到 SSE 响应

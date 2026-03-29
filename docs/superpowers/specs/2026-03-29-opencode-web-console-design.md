@@ -38,8 +38,8 @@
 |------|------|------|
 | Web 框架 | Nuxt 4 | Vue 3 + SSR，内置状态管理 |
 | 认证 | Nuxt Auth (sidebase) | 轻量开源认证方案 |
-| 数据库 | SQLite + Prisma | 零配置，开箱即用 |
-| UI 组件 | 自定义 | 最小集合：Collapsible + Badge + Button |
+| 数据库 | SQLite + Drizzle ORM | 轻量、高效 |
+| UI 组件 | 自定义 | 最小集合 |
 | 实时通信 | SSE | Nuxt Server 代理 |
 | OpenCode | @opencode-ai/sdk | 官方 SDK |
 
@@ -48,7 +48,6 @@
 | 原方案 | 替代方案 | 原因 |
 |--------|---------|------|
 | Better Auth | sidebase/parse | 太复杂 |
-| Drizzle ORM | Prisma | 配置更简单 |
 | Pinia | Nuxt useState | 内置足够用 |
 | shadcn/ui | 自定义组件 | 减少依赖 |
 
@@ -397,37 +396,28 @@ export const useProjects = () => {
 
 ---
 
-## 7. 数据库设计 (Prisma + SQLite)
+## 7. 数据库设计 (Drizzle ORM + SQLite)
 
 ### 7.1 Schema
 
-```prisma
-// prisma/schema.prisma
-datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
-}
+```typescript
+// drizzle/schema.ts
+import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core'
 
-generator client {
-  provider = "prisma-client-js"
-}
+export const users = sqliteTable('users', {
+  id: text('id').primaryKey(),
+  email: text('email').notNull().unique(),
+  password: text('password').notNull(),
+  name: text('name'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+})
 
-model User {
-  id        String    @id @default(cuid())
-  email     String    @unique
-  password  String
-  name      String?
-  projects  Project[]
-  createdAt DateTime  @default(now())
-}
-
-model Project {
-  id        String    @id @default(cuid())
-  name      String
-  userId    String
-  user      User      @relation(fields: [userId], references: [id])
-  createdAt DateTime  @default(now())
-}
+export const projects = sqliteTable('projects', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  userId: text('user_id').notNull().references(() => users.id),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+})
 ```
 
 ### 7.2 用户目录结构
@@ -445,8 +435,9 @@ model Project {
 opencode-web/
 ├── nuxt.config.ts
 ├── package.json
-├── prisma/
-│   └── schema.prisma          # 数据库 Schema
+├── drizzle/
+│   ├── schema.ts              # 数据库 Schema
+│   └── index.ts               # Drizzle 客户端
 ├── composables/
 │   ├── useMessages.ts         # 消息状态
 │   ├── useProjects.ts         # 项目状态
@@ -472,7 +463,7 @@ opencode-web/
 │   │   ├── projects/
 │   │   └── opencode/
 │   └── utils/
-│       └── prisma.ts
+│       └── db.ts
 └── .env
 ```
 
@@ -484,7 +475,7 @@ opencode-web/
 
 ### Phase 1: 最小可用版本 (MVP)
 - [ ] Nuxt 4 项目初始化
-- [ ] Prisma + SQLite 配置
+- [ ] Drizzle ORM + SQLite 配置
 - [ ] 基础认证 (login/register)
 - [ ] 基础项目 CRUD
 - [ ] OpenCode SSE 连接
@@ -557,3 +548,4 @@ interface ToolPart {
 |------|------|---------|
 | 1.0.0 | 2026-03-29 | 初始版本 |
 | 2.0.0 | 2026-03-29 | 极简优化：移除 Better Auth/Drizzle/Pinia，采用 Nuxt 内置方案 |
+| 2.1.0 | 2026-03-29 | 改回 Drizzle ORM (Prisma 体积过大) |
