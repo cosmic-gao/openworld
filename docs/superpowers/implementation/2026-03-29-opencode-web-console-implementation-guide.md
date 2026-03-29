@@ -1,497 +1,420 @@
-# OpenCode Web 控制台实施指南
+# OpenCode Web 控制台实施指南 (极简版)
 
-> 版本: 1.0.0  
+> 版本: 2.0.0  
 > 日期: 2026-03-29  
-> 文档类型: 实施指南
+> 原则: 开源 + 极简
 
 ---
 
-## 1. 环境准备
+## 1. 项目初始化
 
-### 1.1 系统要求
-
-- Node.js >= 20.0.0
-- pnpm >= 8.0.0
-- SQLite (开发环境)
-- PostgreSQL (生产环境)
-- systemd (Linux 服务器)
-
-### 1.2 初始化项目
+### 1.1 创建项目
 
 ```bash
-# 创建 Nuxt 4 项目
+# 初始化 Nuxt 4 项目
 npx nuxi@latest init opencode-web
 cd opencode-web
 
-# 安装依赖
-pnpm install
-
 # 安装核心依赖
-pnpm add @opencode-ai/sdk better-auth drizzle-orm pinia @pinia/nuxt
-pnpm add -D drizzle-kit better-auth-dev-adapter-sqlite
+pnpm add @opencode-ai/sdk prisma @prisma/client
+pnpm add -D prisma
+```
+
+### 1.2 配置 Prisma
+
+```bash
+# 初始化 Prisma (选择 SQLite)
+pnpm prisma init --datasource-provider sqlite
+```
+
+```prisma
+// prisma/schema.prisma
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  password  String
+  name      String?
+  projects  Project[]
+  createdAt DateTime  @default(now())
+}
+
+model Project {
+  id        String    @id @default(cuid())
+  name      String
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  createdAt DateTime  @default(now())
+}
+```
+
+```bash
+# 创建数据库
+pnpm prisma db push
 ```
 
 ---
 
-## 2. Phase 1: 项目初始化
-
-### 2.1 Nuxt 配置
+## 2. Prisma 客户端
 
 ```typescript
-// nuxt.config.ts
-export default defineNuxtConfig({
-  modules: ['@pinia/nuxt', 'shadcn-nuxt'],
-  
-  shadcn: {
-    components: ['ui/button', 'ui/input', 'ui/collapsible', 'ui/badge'],
-  },
+// server/utils/prisma.ts
+import { PrismaClient } from '@prisma/client'
 
-  nitro: {
-    experimental: {
-      websocket: true,
-    },
-  },
+const prisma = new PrismaClient()
 
-  runtimeConfig: {
-    opencodeApiUrl: process.env.OPENCODE_API_URL || 'http://localhost:4096',
-  },
-})
-```
-
-### 2.2 Drizzle ORM 配置
-
-```typescript
-// drizzle/schema.ts
-import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core'
-
-export const users = sqliteTable('users', {
-  id: text('id').primaryKey(),
-  email: text('email').notNull().unique(),
-  passwordHash: text('password_hash').notNull(),
-  name: text('name'),
-  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
-})
-
-export const projects = sqliteTable('projects', {
-  id: text('id').primaryKey(),
-  userId: text('user_id').notNull().references(() => users.id),
-  name: text('name').notNull(),
-  description: text('description'),
-  opencodeDir: text('opencode_dir').notNull(),
-  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
-  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
-})
-
-export const sessions = sqliteTable('sessions', {
-  id: text('id').primaryKey(),
-  projectId: text('project_id').notNull().references(() => projects.id),
-  name: text('name').notNull(),
-  opencodeSessionId: text('opencode_session_id'),
-  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
-  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
-})
-```
-
-```typescript
-// drizzle/index.ts
-import { drizzle } from 'drizzle-orm/libsql'
-import * as schema from './schema'
-
-export const db = drizzle({
-  schema,
-  url: process.env.DATABASE_URL || 'file:./dev.db',
-})
-```
-
-### 2.3 Better Auth 配置
-
-```typescript
-// auth/[...].ts
-import { betterAuth } from 'better-auth'
-import { drizzleAdapter } from 'better-auth/adapters/drizzle'
-import { db } from '~/drizzle'
-
-export const { auth, authHandler } = betterAuth({
-  database: drizzleAdapter(db, {
-    provider: 'sqlite',
-  }),
-  emailAndPassword: {
-    enabled: true,
-  },
-  session: {
-    expiresIn: 60 * 60 * 24 * 7, // 7 days
-  },
-})
+export { prisma }
 ```
 
 ---
 
-## 3. Phase 2: OpenCode 集成
+## 3. 状态管理 (Nuxt useState)
 
-### 3.1 OpenCode SDK 封装
+### 3.1 消息状态
 
 ```typescript
-// composables/useOpencode.ts
-import { OpenCode } from '@opencode-ai/sdk'
+// composables/useMessages.ts
 
-export function useOpencode() {
-  const config = useRuntimeConfig()
-  
-  const client = new OpenCode({
-    baseURL: config.opencodeApiUrl,
-    directory: useUserDirectory(), // /users/{userId}/projects/{projectId}/
-  })
+export interface Message {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  toolParts: ToolPart[]
+  createdAt: number
+}
 
-  return {
-    client,
-    async sendMessage(content: string) {
-      return client.chat.send({ content })
-    },
-    async *streamMessage(content: string) {
-      const response = await client.chat.send({ content })
-      for await (const part of response.parts()) {
-        yield part
-      }
-    },
+export interface ToolPart {
+  id: string
+  tool: string
+  input: Record<string, any>
+  output?: string
+  status: 'pending' | 'running' | 'success' | 'error'
+  error?: string
+}
+
+export const useMessages = () => {
+  const messages = useState<Message[]>('messages', () => [])
+  const streaming = useState<Message | null>('streaming', () => null)
+
+  function addMessage(msg: Message) {
+    messages.value.push(msg)
   }
-}
 
-function useUserDirectory(): string {
-  const authStore = useAuthStore()
-  const projectStore = useProjectStore()
-  return `/users/${authStore.user?.id}/projects/${projectStore.currentProject?.id}`
-}
-```
+  function setStreaming(msg: Message | null) {
+    streaming.value = msg
+  }
 
-### 3.2 SSE 实时流
-
-```typescript
-// composables/useOpencodeSSE.ts
-import { useMessageStore } from '~/stores/message'
-
-export function useOpencodeSSE(sessionId: Ref<string>) {
-  const messageStore = useMessageStore()
-  let eventSource: EventSource | null = null
-
-  function connect() {
-    const config = useRuntimeConfig()
-    const projectStore = useProjectStore()
-    
-    eventSource = new EventSource(
-      `${config.public.apiBase}/opencode/sse?sessionId=${sessionId.value}&directory=/users/${projectStore.currentProject?.id}`
-    )
-
-    eventSource.onmessage = (event) => {
-      const data = JSON.parse(event.data)
-      
-      if (data.type === 'tool') {
-        messageStore.updateToolPart(data.id, data)
-      } else if (data.type === 'message') {
-        messageStore.appendStreamingContent(data.content)
-      } else if (data.type === 'complete') {
-        messageStore.completeStreamingMessage()
-      }
+  function appendContent(content: string) {
+    if (streaming.value) {
+      streaming.value.content += content
     }
   }
 
-  function disconnect() {
-    eventSource?.close()
-    eventSource = null
+  function updateToolPart(id: string, updates: Partial<ToolPart>) {
+    if (!streaming.value) return
+    const idx = streaming.value.toolParts.findIndex(p => p.id === id)
+    if (idx >= 0) {
+      streaming.value.toolParts[idx] = { ...streaming.value.toolParts[idx], ...updates }
+    }
   }
 
-  onUnmounted(() => disconnect())
+  function completeStreaming() {
+    if (streaming.value) {
+      messages.value.push(streaming.value)
+      streaming.value = null
+    }
+  }
 
-  return { connect, disconnect }
+  function clear() {
+    messages.value = []
+    streaming.value = null
+  }
+
+  return {
+    messages: readonly(messages),
+    streaming: readonly(streaming),
+    addMessage,
+    setStreaming,
+    appendContent,
+    updateToolPart,
+    completeStreaming,
+    clear,
+  }
 }
 ```
 
-### 3.3 服务端代理
+### 3.2 项目状态
 
 ```typescript
-// server/api/opencode/sse.get.ts
-import { OpenCode } from '@opencode-ai/sdk'
+// composables/useProjects.ts
 
-export default defineEventHandler(async (event) => {
-  const query = getQuery(event)
-  const { sessionId, directory } = query
+export interface Project {
+  id: string
+  name: string
+  userId: string
+  createdAt: Date
+}
 
-  const config = useRuntimeConfig()
-  
-  const client = new OpenCode({
-    baseURL: config.opencodeApiUrl,
-    directory: directory as string,
+export const useProjects = () => {
+  const projects = useState<Project[]>('projects', () => [])
+  const currentId = useState<string | null>('currentProjectId', () => null)
+
+  const current = computed(() =>
+    projects.value.find(p => p.id === currentId.value) ?? null
+  )
+
+  const opencodeDir = computed(() => {
+    if (!current.value) return null
+    return `/users/${current.value.userId}/projects/${current.value.id}`
   })
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      const encoder = new TextEncoder()
-      
-      try {
-        for await (const part of client.chat.stream()) {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(part)}\n\n`))
-        }
-      } finally {
-        controller.close()
-      }
-    },
-  })
+  async function load() {
+    projects.value = await $fetch('/api/projects')
+  }
 
-  return sendStream(event, stream, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    },
-  })
-})
+  async function create(name: string) {
+    const p = await $fetch('/api/projects', {
+      method: 'POST',
+      body: { name },
+    })
+    projects.value.push(p)
+    return p
+  }
+
+  function switchTo(id: string) {
+    currentId.value = id
+  }
+
+  async function remove(id: string) {
+    await $fetch(`/api/projects/${id}`, { method: 'DELETE' })
+    projects.value = projects.value.filter(p => p.id !== id)
+    if (currentId.value === id) {
+      currentId.value = null
+    }
+  }
+
+  return {
+    projects: readonly(projects),
+    current,
+    currentId: readonly(currentId),
+    opencodeDir,
+    load,
+    create,
+    switchTo,
+    remove,
+  }
+}
 ```
 
----
-
-## 4. Phase 3: 状态管理
-
-### 4.1 useAuthStore
+### 3.3 认证状态
 
 ```typescript
-// stores/auth.ts
-import { defineStore } from 'pinia'
-import type { User } from 'better-auth'
+// composables/useAuth.ts
 
-export const useAuthStore = defineStore('auth', () => {
-  const user = ref<User | null>(null)
+export const useAuth = () => {
+  const user = useState<{ id: string; email: string; name?: string } | null>('user', () => null)
   const isAuthenticated = computed(() => !!user.value)
+
+  async function login(email: string, password: string) {
+    const res = await $fetch('/api/auth/login', {
+      method: 'POST',
+      body: { email, password },
+    })
+    user.value = res.user
+    return res
+  }
+
+  async function register(email: string, password: string, name?: string) {
+    const res = await $fetch('/api/auth/register', {
+      method: 'POST',
+      body: { email, password, name },
+    })
+    user.value = res.user
+    return res
+  }
+
+  async function logout() {
+    await $fetch('/api/auth/logout', { method: 'POST' })
+    user.value = null
+  }
 
   async function fetchUser() {
     try {
-      const { data } = await useFetch('/api/auth/session')
-      user.value = data.value
+      const res = await $fetch('/api/auth/me')
+      user.value = res.user
     } catch {
       user.value = null
     }
   }
 
-  async function login(email: string, password: string) {
-    await $fetch('/api/auth/sign-in', {
-      method: 'POST',
-      body: { email, password },
-    })
-    await fetchUser()
-  }
-
-  async function logout() {
-    await $fetch('/api/auth/sign-out', { method: 'POST' })
-    user.value = null
-  }
-
-  return { user, isAuthenticated, fetchUser, login, logout }
-})
-```
-
-### 4.2 useProjectStore
-
-```typescript
-// stores/project.ts
-import { defineStore } from 'pinia'
-
-export const useProjectStore = defineStore('project', () => {
-  const projects = ref<Project[]>([])
-  const currentProject = ref<Project | null>(null)
-  const sessions = ref<Session[]>([])
-
-  async function loadProjects() {
-    projects.value = await $fetch('/api/projects')
-  }
-
-  async function createProject(name: string, description?: string) {
-    const project = await $fetch('/api/projects', {
-      method: 'POST',
-      body: { name, description },
-    })
-    projects.value.push(project)
-    return project
-  }
-
-  async function switchProject(id: string) {
-    currentProject.value = projects.value.find((p) => p.id === id) || null
-    if (currentProject.value) {
-      await loadSessions(currentProject.value.id)
-    }
-  }
-
-  async function deleteProject(id: string) {
-    await $fetch(`/api/projects/${id}`, { method: 'DELETE' })
-    projects.value = projects.value.filter((p) => p.id !== id)
-    if (currentProject.value?.id === id) {
-      currentProject.value = null
-    }
-  }
-
-  async function loadSessions(projectId: string) {
-    sessions.value = await $fetch(`/api/opencode/sessions?projectId=${projectId}`)
-  }
-
   return {
-    projects, currentProject, sessions,
-    loadProjects, createProject, switchProject, deleteProject, loadSessions,
+    user: readonly(user),
+    isAuthenticated,
+    login,
+    register,
+    logout,
+    fetchUser,
   }
-})
-```
-
-### 4.3 useMessageStore
-
-```typescript
-// stores/message.ts
-import { defineStore } from 'pinia'
-import type { ToolPart, Message } from '@opencode-ai/sdk'
-
-export const useMessageStore = defineStore('message', () => {
-  const messages = ref<Message[]>([])
-  const streamingMessage = ref<Message | null>(null)
-  const pendingTools = ref<ToolPart[]>([])
-
-  function addMessage(message: Message) {
-    messages.value.push(message)
-  }
-
-  function appendStreamingContent(content: string) {
-    if (!streamingMessage.value) {
-      streamingMessage.value = {
-        id: crypto.randomUUID(),
-        role: 'assistant',
-        content: '',
-        parts: [],
-        createdAt: Date.now(),
-      }
-    }
-    streamingMessage.value.content += content
-  }
-
-  function updateToolPart(id: string, updates: Partial<ToolPart>) {
-    if (!streamingMessage.value) return
-    
-    let toolPart = streamingMessage.value.parts.find((p) => p.id === id)
-    if (!toolPart) {
-      toolPart = { id, tool: '', input: {}, state: { status: 'pending' }, ...updates }
-      streamingMessage.value.parts.push(toolPart)
-    }
-    
-    Object.assign(toolPart, updates)
-  }
-
-  function completeStreamingMessage() {
-    if (streamingMessage.value) {
-      messages.value.push(streamingMessage.value)
-      streamingMessage.value = null
-    }
-  }
-
-  function retryMessage(id: string) {
-    const message = messages.value.find((m) => m.id === id)
-    if (message) {
-      streamingMessage.value = { ...message }
-      messages.value = messages.value.filter((m) => m.id !== id)
-    }
-  }
-
-  function deleteMessage(id: string) {
-    messages.value = messages.value.filter((m) => m.id !== id)
-  }
-
-  return {
-    messages, streamingMessage, pendingTools,
-    addMessage, appendStreamingContent, updateToolPart,
-    completeStreamingMessage, retryMessage, deleteMessage,
-  }
-})
+}
 ```
 
 ---
 
-## 5. Phase 4: ToolRegistry UI
+## 4. ToolRegistry 系统
 
-### 5.1 ToolRegistry 核心
+### 4.1 核心实现
 
 ```typescript
 // composables/useToolRegistry.ts
 import type { Component } from 'vue'
 
-interface ToolRegistryState {
-  name: string
-  render?: Component
+export interface ToolComponent {
+  (props: {
+    input: Record<string, any>
+    tool: string
+    output?: string
+    status: 'pending' | 'running' | 'success' | 'error'
+    error?: string
+  }): Component
 }
 
-const state: Record<string, ToolRegistryState> = {}
+const registry: Record<string, ToolComponent> = {}
 
-export function registerTool(input: { name: string; render?: Component }) {
-  state[input.name] = input
-  return input
-}
+export function useToolRegistry() {
+  function register(name: string, component: ToolComponent) {
+    registry[name] = component
+  }
 
-export function getTool(name: string): Component | undefined {
-  return state[name]?.render
-}
+  function render(name: string): ToolComponent | undefined {
+    return registry[name]
+  }
 
-export const ToolRegistry = {
-  register: registerTool,
-  render: getTool,
+  function has(name: string): boolean {
+    return name in registry
+  }
+
+  return { register, render, has, registry }
 }
 ```
 
-### 5.2 BasicTool 基础组件
+### 4.2 工具卡片组件
+
+#### BasicTool.vue (基础卡片)
 
 ```vue
 <!-- components/tool/BasicTool.vue -->
-<script setup lang="ts">
-import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '~/components/ui/collapsible'
-import { Badge } from '~/components/ui/badge'
+<template>
+  <div class="tool-card" :class="{ 'tool-error': status === 'error' }">
+    <button class="tool-header" @click="open = !open">
+      <span class="tool-icon">{{ icon || '🔧' }}</span>
+      <span class="tool-title">{{ title }}</span>
+      <span v-if="subtitle" class="tool-subtitle">{{ subtitle }}</span>
+      <span v-if="status" class="tool-status" :class="status">{{ status }}</span>
+      <span class="tool-chevron" :class="{ open }">▼</span>
+    </button>
+    <div v-show="open" class="tool-content">
+      <slot />
+    </div>
+  </div>
+</template>
 
-const props = defineProps<{
+<script setup lang="ts">
+defineProps<{
   icon?: string
   title: string
   subtitle?: string
-  status?: 'pending' | 'running' | 'success' | 'error'
-  defaultOpen?: boolean
+  status?: string
 }>()
 
-const open = ref(props.defaultOpen ?? false)
-
-const statusVariant = computed(() => {
-  switch (props.status) {
-    case 'error': return 'destructive'
-    case 'running': return 'secondary'
-    case 'success': return 'default'
-    default: return 'outline'
-  }
-})
+const open = ref(true)
 </script>
 
-<template>
-  <Collapsible v-model:open="open">
-    <CollapsibleTrigger as-child>
-      <div class="tool-trigger">
-        <Icon :name="icon ?? 'mcp'" class="tool-icon" />
-        <div class="tool-info">
-          <span class="tool-title">{{ title }}</span>
-          <span v-if="subtitle" class="tool-subtitle">{{ subtitle }}</span>
-        </div>
-        <Badge v-if="status" :variant="statusVariant">{{ status }}</Badge>
-        <Icon name="chevron-down" class="collapse-icon" :class="{ rotated: open }" />
-      </div>
-    </CollapsibleTrigger>
-    <CollapsibleContent>
-      <div class="tool-content">
-        <slot />
-      </div>
-    </CollapsibleContent>
-  </Collapsible>
-</template>
+<style scoped>
+.tool-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  margin: 8px 0;
+  overflow: hidden;
+}
+
+.tool-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  background: #f9fafb;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.tool-header:hover {
+  background: #f3f4f6;
+}
+
+.tool-icon {
+  font-size: 16px;
+}
+
+.tool-title {
+  font-weight: 500;
+  color: #111827;
+}
+
+.tool-subtitle {
+  flex: 1;
+  color: #6b7280;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-status {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background: #e5e7eb;
+  color: #374151;
+}
+
+.tool-status.success { background: #d1fae5; color: #065f46; }
+.tool-status.error { background: #fee2e2; color: #991b1b; }
+.tool-status.running { background: #dbeafe; color: #1e40af; }
+
+.tool-chevron {
+  transition: transform 0.2s;
+  color: #9ca3af;
+}
+
+.tool-chevron.open {
+  transform: rotate(180deg);
+}
+
+.tool-content {
+  padding: 12px;
+  background: white;
+  border-top: 1px solid #e5e7eb;
+}
+</style>
 ```
 
-### 5.3 GenericTool 后备组件
+#### GenericTool.vue (通用后备)
 
 ```vue
 <!-- components/tool/GenericTool.vue -->
 <script setup lang="ts">
+import BasicTool from './BasicTool.vue'
+
 const props = defineProps<{
   tool: string
   input?: Record<string, any>
@@ -504,42 +427,46 @@ const subtitle = computed(() => JSON.stringify(props.input ?? {}))
 </script>
 
 <template>
-  <BasicTool icon="mcp" :title="title" :subtitle="subtitle" :status="status">
-    <pre class="generic-output">{{ output }}</pre>
+  <BasicTool icon="🔧" :title="title" :subtitle="subtitle" :status="status">
+    <pre class="output">{{ output || 'No output' }}</pre>
   </BasicTool>
 </template>
 
 <style scoped>
-.generic-output {
-  @apply text-sm p-3 bg-muted rounded-md overflow-x-auto;
+.output {
+  font-size: 13px;
+  background: #f9fafb;
+  padding: 8px;
+  border-radius: 4px;
+  overflow-x: auto;
 }
 </style>
 ```
 
-### 5.4 BashToolCard
+#### BashToolCard.vue
 
 ```vue
 <!-- components/tool/BashToolCard.vue -->
 <script setup lang="ts">
-import { stripAnsi } from '~/utils/ansi'
+import BasicTool from './BasicTool.vue'
 
 const props = defineProps<{
   input: { command: string; workdir?: string }
   output?: string
-  status?: 'pending' | 'running' | 'success' | 'error'
+  status?: string
 }>()
 
-const title = computed(() => 'Bash')
-const subtitle = computed(() => props.input.command)
+const command = computed(() => props.input?.command ?? '')
+
+function stripAnsi(str: string): string {
+  return str.replace(/\x1B\[[0-9;]*[mK]/g, '')
+}
 </script>
 
 <template>
-  <BasicTool icon="console" :title="title" :subtitle="subtitle" :status="status">
+  <BasicTool icon="⚡" title="Bash" :subtitle="command" :status="status">
     <div class="bash-output">
-      <div class="command">
-        <span class="prompt">$</span>
-        <code>{{ props.input.command }}</code>
-      </div>
+      <code class="command">$ {{ command }}</code>
       <pre v-if="output" class="output">{{ stripAnsi(output) }}</pre>
     </div>
   </BasicTool>
@@ -547,90 +474,103 @@ const subtitle = computed(() => props.input.command)
 
 <style scoped>
 .bash-output {
-  @apply p-3 space-y-2;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .command {
-  @apply flex items-center gap-2;
-}
-
-.prompt {
-  @apply text-green-600 font-bold;
+  color: #059669;
+  font-weight: 500;
 }
 
 .output {
-  @apply text-sm bg-muted p-3 rounded-md overflow-x-auto;
+  font-size: 13px;
+  background: #1f2937;
+  color: #f9fafb;
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0;
 }
 </style>
 ```
 
-### 5.5 ReadToolCard
+#### ReadToolCard.vue
 
 ```vue
 <!-- components/tool/ReadToolCard.vue -->
 <script setup lang="ts">
+import BasicTool from './BasicTool.vue'
+
 const props = defineProps<{
   input: { filePath: string }
   output?: string
-  status?: 'pending' | 'running' | 'success' | 'error'
+  status?: string
 }>()
 
-const title = computed(() => 'Read')
-const subtitle = computed(() => props.input.filePath)
-const filename = computed(() => props.input.filePath.split('/').pop())
+const filename = computed(() => {
+  const parts = (props.input?.filePath ?? '').split('/')
+  return parts[parts.length - 1] || props.input?.filePath
+})
 </script>
 
 <template>
-  <BasicTool icon="glasses" :title="title" :subtitle="subtitle" :status="status">
-    <div class="read-output">
-      <div class="file-header">
-        <Icon name="file-text" />
-        <span>{{ filename }}</span>
-      </div>
-      <pre class="file-content">{{ output }}</pre>
+  <BasicTool icon="📄" title="Read" :subtitle="filename" :status="status">
+    <div class="file-info">
+      <span class="filepath">{{ input.filePath }}</span>
     </div>
+    <pre class="content">{{ output || '(empty)' }}</pre>
   </BasicTool>
 </template>
 
 <style scoped>
-.read-output {
-  @apply p-3;
+.file-info {
+  margin-bottom: 8px;
 }
 
-.file-header {
-  @apply flex items-center gap-2 text-sm text-muted-foreground mb-2;
+.filepath {
+  font-size: 12px;
+  color: #6b7280;
 }
 
-.file-content {
-  @apply text-sm bg-muted p-3 rounded-md overflow-x-auto;
+.content {
+  font-size: 13px;
+  background: #f9fafb;
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0;
 }
 </style>
 ```
 
-### 5.6 EditToolCard (Diff 视图)
+#### EditToolCard.vue
 
 ```vue
 <!-- components/tool/EditToolCard.vue -->
 <script setup lang="ts">
+import BasicTool from './BasicTool.vue'
+
 const props = defineProps<{
   input: { filePath: string; oldString: string; newString: string }
-  status?: 'pending' | 'running' | 'success' | 'error'
+  status?: string
 }>()
 
-const title = computed(() => 'Edit')
-const subtitle = computed(() => props.input.filePath)
+const filename = computed(() => {
+  const parts = (props.input?.filePath ?? '').split('/')
+  return parts[parts.length - 1]
+})
 </script>
 
 <template>
-  <BasicTool icon="code-lines" :title="title" :subtitle="subtitle" :status="status">
+  <BasicTool icon="✏️" title="Edit" :subtitle="filename" :status="status">
     <div class="diff-view">
       <div class="diff-line removed">
-        <span class="diff-marker">-</span>
-        <code>{{ props.input.oldString }}</code>
+        <span>- {{ input.oldString }}</span>
       </div>
       <div class="diff-line added">
-        <span class="diff-marker">+</span>
-        <code>{{ props.input.newString }}</code>
+        <span>+ {{ input.newString }}</span>
       </div>
     </div>
   </BasicTool>
@@ -638,260 +578,692 @@ const subtitle = computed(() => props.input.filePath)
 
 <style scoped>
 .diff-view {
-  @apply p-3 space-y-1 font-mono text-sm;
+  font-family: monospace;
+  font-size: 13px;
 }
 
 .diff-line {
-  @apply flex items-start p-1 rounded;
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin: 4px 0;
 }
 
 .diff-line.removed {
-  @apply bg-red-500/10 text-red-600;
+  background: #fee2e2;
+  color: #991b1b;
 }
 
 .diff-line.added {
-  @apply bg-green-500/10 text-green-600;
-}
-
-.diff-marker {
-  @apply w-4 flex-shrink-0;
+  background: #d1fae5;
+  color: #065f46;
 }
 </style>
 ```
 
-### 5.7 工具卡片注册
+#### WriteToolCard.vue
+
+```vue
+<!-- components/tool/WriteToolCard.vue -->
+<script setup lang="ts">
+import BasicTool from './BasicTool.vue'
+
+const props = defineProps<{
+  input: { filePath: string; content: string }
+  status?: string
+}>()
+
+const filename = computed(() => {
+  const parts = (props.input?.filePath ?? '').split('/')
+  return parts[parts.length - 1]
+})
+</script>
+
+<template>
+  <BasicTool icon="📝" title="Write" :subtitle="filename" :status="status">
+    <div class="file-preview">
+      <pre>{{ input.content }}</pre>
+    </div>
+  </BasicTool>
+</template>
+
+<style scoped>
+.file-preview pre {
+  font-size: 13px;
+  background: #f9fafb;
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0;
+}
+</style>
+```
+
+### 4.3 注册工具
 
 ```typescript
-// components/tool/index.ts
-import BashToolCard from './BashToolCard.vue'
-import ReadToolCard from './ReadToolCard.vue'
-import EditToolCard from './EditToolCard.vue'
-import WriteToolCard from './WriteToolCard.vue'
-import GenericTool from './GenericTool.vue'
+// plugins/toolRegistry.client.ts
+import { useToolRegistry } from '~/composables/useToolRegistry'
+import GenericTool from '~/components/tool/GenericTool.vue'
+import BashToolCard from '~/components/tool/BashToolCard.vue'
+import ReadToolCard from '~/components/tool/ReadToolCard.vue'
+import EditToolCard from '~/components/tool/EditToolCard.vue'
+import WriteToolCard from '~/components/tool/WriteToolCard.vue'
 
-export function registerToolComponents() {
-  ToolRegistry.register({ name: 'bash', render: BashToolCard })
-  ToolRegistry.register({ name: 'read', render: ReadToolCard })
-  ToolRegistry.register({ name: 'edit', render: EditToolCard })
-  ToolRegistry.register({ name: 'write', render: WriteToolCard })
-  ToolRegistry.register({ name: 'glob', render: GlobToolCard })
-  ToolRegistry.register({ name: 'grep', render: GrepToolCard })
-  // ... 其他工具
-}
+export default defineNuxtPlugin(() => {
+  const { register } = useToolRegistry()
+
+  register('bash', BashToolCard)
+  register('read', ReadToolCard)
+  register('edit', EditToolCard)
+  register('write', WriteToolCard)
+  register('glob', GenericTool)
+  register('grep', GenericTool)
+})
 ```
 
 ---
 
-## 6. Phase 5: 页面与功能
+## 5. 消息组件
 
-### 6.1 消息列表组件
-
-```vue
-<!-- components/message/MessageList.vue -->
-<script setup lang="ts">
-const messageStore = useMessageStore()
-
-const messages = computed(() => messageStore.messages)
-const streamingMessage = computed(() => messageStore.streamingMessage)
-</script>
-
-<template>
-  <div class="message-list">
-    <MessageItem
-      v-for="message in messages"
-      :key="message.id"
-      :message="message"
-    />
-    
-    <MessageItem
-      v-if="streamingMessage"
-      :message="streamingMessage"
-      :streaming="true"
-    />
-  </div>
-</template>
-```
-
-### 6.2 ToolPartDisplay 组件
+### 5.1 ToolPartDisplay
 
 ```vue
 <!-- components/message/ToolPartDisplay.vue -->
 <script setup lang="ts">
-import { markRaw } from 'vue'
+import { useToolRegistry } from '~/composables/useToolRegistry'
 import GenericTool from '~/components/tool/GenericTool.vue'
+import type { ToolPart } from '~/composables/useMessages'
 
 const props = defineProps<{
   toolPart: ToolPart
 }>()
 
-const ToolComponent = computed(() => {
-  const render = ToolRegistry.render(props.toolPart.tool)
-  return render ? markRaw(render) : markRaw(GenericTool)
+const { render } = useToolRegistry()
+
+const Component = computed(() => {
+  return render(props.toolPart.tool) ?? GenericTool
 })
 </script>
 
 <template>
   <component
-    :is="ToolComponent"
+    :is="Component"
     :input="toolPart.input"
     :tool="toolPart.tool"
-    :metadata="toolPart.metadata"
-    :output="toolPart.state.output"
-    :status="toolPart.state.status"
+    :output="toolPart.output"
+    :status="toolPart.status"
+    :error="toolPart.error"
   />
 </template>
 ```
 
-### 6.3 项目工作区页面
+### 5.2 MessageList
 
 ```vue
-<!-- pages/projects/[projectId]/index.vue -->
+<!-- components/message/MessageList.vue -->
+<script setup lang="ts">
+import { useMessages } from '~/composables/useMessages'
+import ToolPartDisplay from './ToolPartDisplay.vue'
+
+const { messages, streaming } = useMessages()
+</script>
+
+<template>
+  <div class="message-list">
+    <div
+      v-for="msg in messages"
+      :key="msg.id"
+      class="message"
+      :class="msg.role"
+    >
+      <div class="message-content">
+        <template v-if="msg.role === 'user'">
+          {{ msg.content }}
+        </template>
+        <template v-else>
+          <div v-if="msg.content" class="assistant-content">
+            {{ msg.content }}
+          </div>
+          <div v-if="msg.toolParts.length" class="tool-parts">
+            <ToolPartDisplay
+              v-for="tp in msg.toolParts"
+              :key="tp.id"
+              :tool-part="tp"
+            />
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <div v-if="streaming" class="message assistant streaming">
+      <div class="message-content">
+        <div v-if="streaming.content" class="assistant-content">
+          {{ streaming.content }}
+        </div>
+        <div v-if="streaming.toolParts.length" class="tool-parts">
+          <ToolPartDisplay
+            v-for="tp in streaming.toolParts"
+            :key="tp.id"
+            :tool-part="tp"
+          />
+        </div>
+        <span class="typing-indicator">...</span>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.message {
+  max-width: 100%;
+}
+
+.message.user {
+  text-align: right;
+}
+
+.message-content {
+  display: inline-block;
+  padding: 12px 16px;
+  border-radius: 12px;
+  text-align: left;
+}
+
+.message.user .message-content {
+  background: #3b82f6;
+  color: white;
+}
+
+.message.assistant .message-content {
+  background: #f3f4f6;
+  color: #111827;
+}
+
+.tool-parts {
+  margin-top: 12px;
+}
+
+.typing-indicator {
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+</style>
+```
+
+---
+
+## 6. API 端点
+
+### 6.1 认证
+
+```typescript
+// server/api/auth/login.post.ts
+import { prisma } from '~/server/utils/prisma'
+
+export default defineEventHandler(async (event) => {
+  const body = await readBody(event)
+  const { email, password } = body
+
+  const user = await prisma.user.findUnique({ where: { email } })
+  if (!user || user.password !== password) {
+    throw createError({ statusCode: 401, message: 'Invalid credentials' })
+  }
+
+  return {
+    user: { id: user.id, email: user.email, name: user.name },
+  }
+})
+```
+
+```typescript
+// server/api/auth/register.post.ts
+import { prisma } from '~/server/utils/prisma'
+
+export default defineEventHandler(async (event) => {
+  const body = await readBody(event)
+  const { email, password, name } = body
+
+  const existing = await prisma.user.findUnique({ where: { email } })
+  if (existing) {
+    throw createError({ statusCode: 400, message: 'Email already exists' })
+  }
+
+  const user = await prisma.user.create({
+    data: { email, password, name },
+  })
+
+  return {
+    user: { id: user.id, email: user.email, name: user.name },
+  }
+})
+```
+
+### 6.2 项目管理
+
+```typescript
+// server/api/projects/index.get.ts
+import { prisma } from '~/server/utils/prisma'
+
+export default defineEventHandler(async (event) => {
+  const user = await getUser(event)
+  const projects = await prisma.project.findMany({
+    where: { userId: user.id },
+    orderBy: { createdAt: 'desc' },
+  })
+  return projects
+})
+```
+
+```typescript
+// server/api/projects/index.post.ts
+import { prisma } from '~/server/utils/prisma'
+
+export default defineEventHandler(async (event) => {
+  const user = await getUser(event)
+  const body = await readBody(event)
+
+  const project = await prisma.project.create({
+    data: {
+      name: body.name,
+      userId: user.id,
+    },
+  })
+
+  // 创建用户目录
+  const dir = `/users/${user.id}/projects/${project.id}/workspace`
+  // TODO: 在实际文件系统中创建目录
+
+  return project
+})
+```
+
+### 6.3 OpenCode 代理
+
+```typescript
+// server/api/opencode/sse.get.ts
+export default defineEventHandler(async (event) => {
+  const query = getQuery(event)
+  const { sessionId, directory } = query
+
+  const config = useRuntimeConfig()
+  const url = `${config.opencodeApiUrl}/sse?sessionId=${sessionId}&directory=${directory}`
+
+  const stream = await fetch(url, {
+    headers: {
+      'Accept': 'text/event-stream',
+    },
+  })
+
+  return sendStream(event, stream.body!, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    },
+  })
+})
+```
+
+```typescript
+// server/api/opencode/chat.post.ts
+export default defineEventHandler(async (event) => {
+  const body = await readBody(event)
+  const { content, directory } = body
+
+  const config = useRuntimeConfig()
+
+  const response = await fetch(`${config.opencodeApiUrl}/chat`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-opencode-directory': directory,
+    },
+    body: JSON.stringify({ content }),
+  })
+
+  return response.json()
+})
+```
+
+---
+
+## 7. 页面
+
+### 7.1 登录页
+
+```vue
+<!-- pages/index.vue -->
+<script setup lang="ts">
+const { login, register, isAuthenticated, fetchUser } = useAuth()
+
+const isLogin = ref(true)
+const email = ref('')
+const password = ref('')
+const name = ref('')
+
+onMounted(async () => {
+  await fetchUser()
+  if (isAuthenticated.value) {
+    navigateTo('/projects')
+  }
+})
+
+async function handleSubmit() {
+  try {
+    if (isLogin.value) {
+      await login(email.value, password.value)
+    } else {
+      await register(email.value, password.value, name.value)
+    }
+    navigateTo('/projects')
+  } catch (e: any) {
+    alert(e.data?.message || 'Error')
+  }
+}
+</script>
+
+<template>
+  <div class="auth-page">
+    <h1>OpenCode Web</h1>
+    
+    <form @submit.prevent="handleSubmit">
+      <h2>{{ isLogin ? 'Login' : 'Register' }}</h2>
+      
+      <input v-model="email" type="email" placeholder="Email" required />
+      <input v-model="password" type="password" placeholder="Password" required />
+      <input v-if="!isLogin" v-model="name" type="text" placeholder="Name" />
+      
+      <button type="submit">{{ isLogin ? 'Login' : 'Register' }}</button>
+    </form>
+    
+    <button @click="isLogin = !isLogin">
+      Switch to {{ isLogin ? 'Register' : 'Login' }}
+    </button>
+  </div>
+</template>
+
+<style scoped>
+.auth-page {
+  max-width: 400px;
+  margin: 100px auto;
+  padding: 24px;
+  text-align: center;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 24px 0;
+}
+
+input {
+  padding: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+}
+
+button {
+  padding: 12px;
+  background: #3b82f6;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+</style>
+```
+
+### 7.2 项目列表页
+
+```vue
+<!-- pages/projects.vue -->
+<script setup lang="ts">
+const { projects, load, create, switchTo, remove } = useProjects()
+const { isAuthenticated } = useAuth()
+
+const showNew = ref(false)
+const newName = ref('')
+
+onMounted(async () => {
+  if (!isAuthenticated.value) {
+    navigateTo('/')
+    return
+  }
+  await load()
+})
+
+async function handleCreate() {
+  if (!newName.value.trim()) return
+  await create(newName.value)
+  newName.value = ''
+  showNew.value = false
+}
+</script>
+
+<template>
+  <div class="projects-page">
+    <header>
+      <h1>Projects</h1>
+      <button @click="showNew = !showNew">New Project</button>
+    </header>
+
+    <div v-if="showNew" class="new-project">
+      <input v-model="newName" placeholder="Project name" @keyup.enter="handleCreate" />
+      <button @click="handleCreate">Create</button>
+    </div>
+
+    <div class="project-list">
+      <div v-for="project in projects" :key="project.id" class="project-card">
+        <div @click="switchTo(project.id); navigateTo(`/project/${project.id}`)">
+          <h3>{{ project.name }}</h3>
+          <p>{{ new Date(project.createdAt).toLocaleDateString() }}</p>
+        </div>
+        <button @click.stop="remove(project.id)">Delete</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.projects-page {
+  max-width: 800px;
+  margin: 40px auto;
+  padding: 24px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.project-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 16px;
+}
+
+.project-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 16px;
+  cursor: pointer;
+}
+
+.project-card:hover {
+  border-color: #3b82f6;
+}
+</style>
+```
+
+### 7.3 项目工作区
+
+```vue
+<!-- pages/project/[id].vue -->
 <script setup lang="ts">
 const route = useRoute()
-const projectId = route.params.projectId as string
-const messageStore = useMessageStore()
-const projectStore = useProjectStore()
-const { connect, disconnect } = useOpencodeSSE(computed(() => projectId))
+const projectId = route.params.id as string
+
+const { current, opencodeDir, switchTo } = useProjects()
+const { messages, streaming, setStreaming, appendContent, updateToolPart, completeStreaming, clear } = useMessages()
+const { isAuthenticated } = useAuth()
 
 const input = ref('')
 
-onMounted(() => {
-  projectStore.switchProject(projectId)
-  connect()
+onMounted(async () => {
+  if (!isAuthenticated.value) {
+    navigateTo('/')
+    return
+  }
+  switchTo(projectId)
+  clear()
 })
 
-onUnmounted(() => disconnect())
-
 async function sendMessage() {
-  if (!input.value.trim()) return
-  
+  if (!input.value.trim() || !opencodeDir.value) return
+
   const content = input.value
   input.value = ''
-  
-  messageStore.appendStreamingContent('')
-  await $fetch('/api/opencode/chat', {
-    method: 'POST',
-    body: { content, sessionId: projectId },
+
+  setStreaming({
+    id: crypto.randomUUID(),
+    role: 'assistant',
+    content: '',
+    toolParts: [],
+    createdAt: Date.now(),
   })
+
+  try {
+    const response = await fetch('/api/opencode/chat', {
+      method: 'POST',
+      body: JSON.stringify({
+        content,
+        directory: opencodeDir.value,
+      }),
+    })
+
+    const reader = response.body?.getReader()
+    const decoder = new TextDecoder()
+
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const text = decoder.decode(value)
+        const lines = text.split('\n')
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = JSON.parse(line.slice(6))
+            
+            if (data.type === 'content') {
+              appendContent(data.content)
+            } else if (data.type === 'tool') {
+              updateToolPart(data.id, data)
+            } else if (data.type === 'done') {
+              completeStreaming()
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Error:', e)
+    completeStreaming()
+  }
 }
 </script>
 
 <template>
   <div class="workspace">
-    <div class="workspace-header">
-      <h1>{{ projectStore.currentProject?.name }}</h1>
-      <ProjectSwitcher />
-    </div>
-    
-    <MessageList class="workspace-messages" />
-    
-    <div class="workspace-input">
-      <Input
+    <header>
+      <h1>{{ current?.name || 'Project' }}</h1>
+      <NuxtLink to="/projects">← Back</NuxtLink>
+    </header>
+
+    <MessageList />
+
+    <div class="input-area">
+      <textarea
         v-model="input"
         placeholder="Send a message..."
-        @keydown.enter="sendMessage"
+        @keydown.enter.exact.prevent="sendMessage"
       />
-      <Button @click="sendMessage">Send</Button>
+      <button @click="sendMessage">Send</button>
     </div>
   </div>
 </template>
-```
 
----
+<style scoped>
+.workspace {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 20px;
+}
 
-## 7. Phase 6: systemd 部署
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
 
-### 7.1 服务文件
+.input-area {
+  margin-top: auto;
+  display: flex;
+  gap: 12px;
+}
 
-```ini
-# /etc/systemd/system/opencode@.service
-[Unit]
-Description=OpenCode Server for User %i
-After=network.target
-
-[Service]
-Type=simple
-User=%i
-WorkingDirectory=/home/%i
-ExecStart=/usr/local/bin/opencode serve --port 4096
-Environment=OPENCODE_DIRECTORY=/users/%i
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 7.2 用户管理脚本
-
-```bash
-#!/bin/bash
-# scripts/create-opencode-user.sh
-
-USER_ID=$1
-USER_HOME=/users/$USER_ID
-
-# 创建目录结构
-mkdir -p $USER_HOME/projects
-mkdir -p $USER_HOME/.opencode
-
-# 设置权限
-chown -R $USER_ID:$USER_ID $USER_HOME
-
-# 启用服务
-systemctl enable opencode@$USER_ID
-systemctl start opencode@$USER_ID
+textarea {
+  flex: 1;
+  padding: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  resize: none;
+  height: 60px;
+}
+</style>
 ```
 
 ---
 
 ## 8. 验证清单
 
-### 8.1 本地开发验证
-
-- [ ] Nuxt 开发服务器启动成功 (pnpm dev)
-- [ ] 数据库迁移成功 (pnpm db:migrate)
-- [ ] 用户注册/登录功能正常
-- [ ] 项目创建/切换/删除功能正常
-- [ ] OpenCode SSE 连接正常
-- [ ] 工具卡片渲染正常
-- [ ] 消息流式输出正常
-
-### 8.2 生产部署验证
-
-- [ ] systemd 服务运行正常
-- [ ] nginx 反向代理配置正确
-- [ ] HTTPS 证书配置正确
-- [ ] 数据库迁移到 PostgreSQL 成功
-- [ ] 用户目录权限配置正确
+- [ ] 项目启动: `pnpm dev`
+- [ ] 数据库创建: `pnpm prisma db push`
+- [ ] 用户注册/登录
+- [ ] 创建项目
+- [ ] 发送消息，收到 SSE 响应
+- [ ] 工具卡片正确渲染
 
 ---
 
 ## 9. 常见问题
 
-### 9.1 SSE 连接断开
+### 9.1 SSE 不工作
 
-检查 OpenCode 服务器是否正常运行：
-```bash
-systemctl status opencode@username
-```
+检查 OpenCode 服务器是否运行在 4096 端口。
 
 ### 9.2 工具卡片不显示
 
-确认工具已注册：
-```typescript
-// 在 Nuxt 插件中注册
-export default defineNuxtPlugin(() => {
-  registerToolComponents()
-})
-```
+确认在 `plugins/toolRegistry.client.ts` 中已注册。
 
-### 9.3 权限错误
+### 9.3 目录权限错误
 
-检查目录权限：
-```bash
-ls -la /users/{userId}/projects/{projectId}
-chown -R opencode:opencode /users/{userId}
-```
+确保 `/users/{userId}/projects/{projectId}/workspace` 目录存在且可写。
